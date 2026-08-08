@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { canFastAppendShape, canFastBackspaceShape } from '../components/textInput.js'
+import {
+  canFastAppendShape,
+  canFastBackspaceShape,
+  colorizeEcho,
+  supportsFastEchoTerminal
+} from '../components/textInput.js'
 
 // The fast-echo path bypasses Ink and writes characters directly to stdout
 // for the common case of typing plain English at the end of the line. These
@@ -132,5 +137,130 @@ describe('canFastBackspaceShape', () => {
 
   it('rejects deleting an emoji', () => {
     expect(canFastBackspaceShape('hi🙂', 'hi🙂'.length)).toBe(false)
+  })
+
+  // Closes Copilot PR #26717 round 3: the "\b \b" sequence cannot move
+  // the terminal cursor onto the previous visual row across a
+  // soft-wrap boundary. When the caret sits at visual column 0 of a
+  // wrapped row (column == 0 in the computed cursor layout), backspace
+  // would leave the physical cursor in place while the logical caret
+  // moves up to the end of the previous visual line — desyncing both
+  // Ink's displayCursor model and the user-visible position. The fast
+  // path must fall through in that case so the normal Ink render path
+  // can lay out the correct cursor position.
+  it('rejects fast-backspace at a soft-wrap boundary when columns is known', () => {
+    // value width 6 in a column of 6 → cursorLayout produces (line 1, col 0)
+    // i.e. the caret has overflowed onto the next visual line.
+    const value = 'hello '
+    expect(canFastBackspaceShape(value, value.length, 6)).toBe(false)
+  })
+
+  it('rejects fast-backspace at an exact multiple of columns (wide wrap)', () => {
+    // 12 chars at width 6 → two full visual rows, caret at (line 2, col 0).
+    const value = 'abcdefghijkl'
+    expect(canFastBackspaceShape(value, value.length, 6)).toBe(false)
+  })
+
+  it('still accepts fast-backspace inside a wrapped line', () => {
+    // Caret mid-visual-line — "\b \b" can move the cursor one cell left
+    // without crossing a wrap boundary.
+    expect(canFastBackspaceShape('hello world', 'hello world'.length, 20)).toBe(true)
+    expect(canFastBackspaceShape('abcdefghi', 9, 6)).toBe(true) // visual line 1, col 3 → ok
+  })
+
+  it('skips the wrap-boundary check when columns is omitted (legacy contract)', () => {
+    // Callers that don't pass `columns` fall back to the pre-wrap-aware
+    // behavior — the function does NOT magically reject anything that
+    // could be a wrap boundary without the width. Production callers
+    // must always pass `columns`; this case is for unit tests of the
+    // pre-wrap shape contract.
+    expect(canFastBackspaceShape('hello ', 'hello '.length)).toBe(true)
+  })
+})
+
+describe('colorizeEcho', () => {
+  // The fast-echo bypass writes raw cells past Ink, so a themed input must
+  // carry the theme fg explicitly — a default-fg glyph goes invisible when a
+  // skin repaints the background to the opposite polarity (dark skin on a
+  // light terminal ⇒ black-on-black).
+
+  it('wraps the write in truecolor fg + reset for a hex theme color', () => {
+    expect(colorizeEcho('x', '#ff2d95')).toBe('\x1b[38;2;255;45;149mx\x1b[39m')
+  })
+
+  it('passes through untouched without a color (unthemed keeps terminal default)', () => {
+    expect(colorizeEcho('x')).toBe('x')
+    expect(colorizeEcho('x', undefined)).toBe('x')
+  })
+
+  it('passes through on a non-hex color (never emit a garbage SGR)', () => {
+    expect(colorizeEcho('x', 'red')).toBe('x')
+    expect(colorizeEcho('x', '#fff')).toBe('x')
+  })
+})
+
+describe('supportsFastEchoTerminal', () => {
+  it('disables fast-echo in Apple Terminal', () => {
+    expect(supportsFastEchoTerminal({ TERM_PROGRAM: 'Apple_Terminal' } as NodeJS.ProcessEnv)).toBe(false)
+  })
+
+  it('disables fast-echo inside tmux', () => {
+    expect(supportsFastEchoTerminal({ TMUX: '/tmp/tmux-1000/default,1234,0' } as NodeJS.ProcessEnv)).toBe(false)
+    expect(supportsFastEchoTerminal({ TMUX: '/private/tmp/tmux-501/default' } as NodeJS.ProcessEnv)).toBe(false)
+  })
+
+  it('tmux wins over Termux fast-echo opt-in', () => {
+    expect(
+      supportsFastEchoTerminal({
+        TMUX: '/tmp/tmux-1000/default,1234,0',
+        HERMES_TUI_TERMUX_FAST_ECHO: '1',
+        TERMUX_VERSION: '0.118.0'
+      } as NodeJS.ProcessEnv)
+    ).toBe(false)
+  })
+
+  it('keeps fast-echo enabled when TMUX is empty or unset', () => {
+    expect(supportsFastEchoTerminal({ TMUX: '' } as NodeJS.ProcessEnv)).toBe(true)
+    expect(supportsFastEchoTerminal({ TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv)).toBe(true)
+  })
+
+  it('disables fast-echo when only a tmux-flavored TERM is present (SSH from tmux, no TMUX forwarded)', () => {
+    // OpenSSH forwards TERM but not TMUX, so a TUI on a remote host launched
+    // from inside local tmux sees TERM=tmux-256color with no TMUX var. The
+    // cursor-drift bug still applies, so fast-echo must stay off.
+    expect(supportsFastEchoTerminal({ TERM: 'tmux' } as NodeJS.ProcessEnv)).toBe(false)
+    expect(supportsFastEchoTerminal({ TERM: 'tmux-256color' } as NodeJS.ProcessEnv)).toBe(false)
+  })
+
+  it('does NOT disable fast-echo for screen-flavored TERM (GNU screen out of scope, no reported drift)', () => {
+    // GNU screen sets TERM=screen/screen-256color and has no reported drift.
+    // We must not widen the tmux guard to screen* and regress its perf.
+    expect(supportsFastEchoTerminal({ TERM: 'screen' } as NodeJS.ProcessEnv)).toBe(true)
+    expect(supportsFastEchoTerminal({ TERM: 'screen-256color' } as NodeJS.ProcessEnv)).toBe(true)
+    // And an unrelated 256color TERM must stay enabled.
+    expect(supportsFastEchoTerminal({ TERM: 'xterm-256color' } as NodeJS.ProcessEnv)).toBe(true)
+  })
+
+  it('disables fast-echo by default in Termux mode', () => {
+    expect(
+      supportsFastEchoTerminal({
+        TERMUX_VERSION: '0.118.0',
+        PREFIX: '/data/data/com.termux/files/usr'
+      } as NodeJS.ProcessEnv)
+    ).toBe(false)
+  })
+
+  it('allows explicit Termux fast-echo opt-in via env override', () => {
+    expect(
+      supportsFastEchoTerminal({
+        HERMES_TUI_TERMUX_FAST_ECHO: '1',
+        TERMUX_VERSION: '0.118.0'
+      } as NodeJS.ProcessEnv)
+    ).toBe(true)
+  })
+
+  it('keeps fast-echo enabled in VS Code and unknown non-Termux terminals', () => {
+    expect(supportsFastEchoTerminal({ TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv)).toBe(true)
+    expect(supportsFastEchoTerminal({ TERM: 'xterm-256color' } as NodeJS.ProcessEnv)).toBe(true)
   })
 })

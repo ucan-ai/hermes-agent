@@ -14,20 +14,28 @@ the user gets full Hermes capability inside a Codex turn.
 Scope (what we expose):
   - web_search, web_extract              — Firecrawl, no codex equivalent
   - browser_navigate / _click / _type /  — Camofox/Browserbase automation
-    _snapshot / _screenshot / _scroll / _back / _press / _vision
-  - delegate_task                        — Hermes subagents
+    _snapshot / _scroll / _back / _press /
+    _get_images / _console / _vision
   - vision_analyze                       — image inspection by vision model
   - image_generate                       — image generation
-  - memory                               — Hermes' persistent memory store
   - skill_view, skills_list              — Hermes' skill library
-  - session_search                       — cross-session search
   - text_to_speech                       — TTS
+  - kanban_* (complete/block/comment/    — kanban worker + orchestrator
+    heartbeat/show/list/create/            handoff (stateless: read env var,
+    unblock/link)                          write ~/.hermes/kanban.db)
 
-What we DO NOT expose (codex has equivalents):
+What we DO NOT expose:
   - terminal / shell                     — codex's own shell tool
   - read_file / write_file / patch       — codex's apply_patch + shell
   - search_files / process               — codex's shell
-  - clarify, todo                        — codex's own UX
+  - clarify                              — codex's own UX
+  - delegate_task / memory /             — `_AGENT_LOOP_TOOLS` in Hermes
+    session_search / todo                  (model_tools.py). They require
+                                           the running AIAgent context to
+                                           dispatch (mid-loop state), so a
+                                           stateless MCP callback can't
+                                           drive them. See the inline
+                                           comment on EXPOSED_TOOLS below.
 
 Run with: python -m agent.transports.hermes_tools_mcp_server
 Spawned by: CodexAppServerSession.ensure_started() when the runtime is
@@ -36,6 +44,7 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -43,6 +52,49 @@ import sys
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# JSON Schema type -> Python type mapping for signature generation
+_JSON_TO_PY = {
+    "string": str,
+    "integer": int,
+    "number": float,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict[str, type]]:
+    """Build a Python function signature and annotations from a JSON schema.
+
+    Args:
+        schema: JSON Schema dict with "properties" and "required" keys.
+
+    Returns:
+        (signature, annotations_dict) where signature has KEYWORD_ONLY params
+        and annotations maps param names to Python types.
+    """
+    props = (schema or {}).get("properties") or {}
+    required = set((schema or {}).get("required") or [])
+    params, annots = [], {}
+
+    for pname, pspec in props.items():
+        if pname.startswith("_"):
+            continue
+        py = _JSON_TO_PY.get((pspec or {}).get("type"), Any)
+        ann, default = (
+            (py, inspect.Parameter.empty)
+            if pname in required
+            else (Optional[py], None)
+        )
+        annots[pname] = ann
+        params.append(
+            inspect.Parameter(
+                pname, inspect.Parameter.KEYWORD_ONLY, annotation=ann, default=default
+            )
+        )
+
+    return inspect.Signature(params, return_annotation=str), annots
 
 
 # Tools we expose. Each name MUST match a registered Hermes tool that
@@ -151,29 +203,36 @@ def _build_server() -> Any:
         # the result string. We use add_tool() for full control over the
         # input schema (FastMCP's @tool() decorator inspects type hints,
         # which we can't get from a JSON schema at runtime).
-        def _make_handler(tool_name: str):
+        def _make_handler(tool_name: str, schema: dict | None):
+            sig, annots = _signature_from_schema(schema)
+
             def _dispatch(**kwargs: Any) -> str:
                 try:
-                    return handle_function_call(tool_name, kwargs or {})
+                    # Filter out None values before dispatch so unset optionals
+                    # aren't forwarded to the handler.
+                    args = {k: v for k, v in kwargs.items() if v is not None}
+                    return handle_function_call(tool_name, args or {})
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})
+
             _dispatch.__name__ = tool_name
             _dispatch.__doc__ = description
+            _dispatch.__signature__ = sig
+            _dispatch.__annotations__ = {**annots, "return": str}
             return _dispatch
 
         try:
             mcp.add_tool(
-                _make_handler(name),
+                _make_handler(name, params_schema),
                 name=name,
                 description=description,
-                # FastMCP accepts JSON schema directly via the
-                # input_schema parameter on newer versions; older
-                # versions use parameters_schema. Try both for compat.
             )
         except TypeError:
-            # Older mcp SDK signature — fall back to decorator-style.
-            handler = _make_handler(name)
+            # Older mcp SDK signature — fall back to decorator-style. The
+            # synthesized __signature__ on the handler still drives schema
+            # generation there.
+            handler = _make_handler(name, params_schema)
             handler = mcp.tool(name=name, description=description)(handler)
 
         exposed_count += 1
