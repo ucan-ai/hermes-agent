@@ -81,6 +81,7 @@ RUN uv sync --frozen --no-install-project --extra all
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
 COPY --chown=hermes:hermes . .
+RUN sed -i 's/\r$//' /opt/hermes/docker/entrypoint.sh && chmod +x /opt/hermes/docker/entrypoint.sh
 
 # Build browser dashboard and terminal UI assets.
 RUN cd web && npm run build && \
