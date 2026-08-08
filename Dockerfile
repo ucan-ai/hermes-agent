@@ -386,6 +386,7 @@ RUN mkdir -p /tmp/hermes-runtime && chmod 0700 /tmp/hermes-runtime
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
+<<<<<<< HEAD
 # --link decouples this layer from parents for cache purposes; --chmod bakes
 # the final read-only permissions at copy time so we skip the separate
 # `chmod -R` pass that previously walked ~30k files across the venv +
@@ -393,6 +394,10 @@ RUN mkdir -p /tmp/hermes-runtime && chmod 0700 /tmp/hermes-runtime
 # gives the non-root hermes user read + traverse but no write; root retains
 # write so the build steps below don't need chmod u+w dances.
 COPY --link --chmod=a+rX,go-w . .
+=======
+COPY --chown=hermes:hermes . .
+RUN sed -i 's/\r$//' /opt/hermes/docker/entrypoint.sh && chmod +x /opt/hermes/docker/entrypoint.sh
+>>>>>>> 0f2b44c7c7 (local version)
 
 # The shared assembler binds the prepared environment and frontend products.
 RUN /opt/hermes/.venv/bin/python -m docker.build_agent

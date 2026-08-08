@@ -32,12 +32,16 @@ services:
     image: hermes-agent
     container_name: hermes
     restart: unless-stopped
-    network_mode: host
     volumes:
       - ~/.hermes:/opt/data
+    ports:
+      - "127.0.0.1:8642:8642"
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${API_SERVER_KEY:-local-dev-key-change-me}
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
@@ -64,7 +68,8 @@ services:
     image: hermes-agent
     container_name: hermes-dashboard
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "127.0.0.1:9119:9119"
     depends_on:
       - gateway
     volumes:
@@ -72,5 +77,5 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
-    # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
-    command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+    # Localhost-only on the host due the 127.0.0.1 port bind.
+    command: ["dashboard", "--host", "0.0.0.0", "--insecure", "--no-open"]
